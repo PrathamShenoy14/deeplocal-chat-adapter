@@ -15,7 +15,7 @@ async function assertSameDirectory(actual, expected) {
 // Exercise the actual source against VS Code's real filesystem, edits and URIs.
 buildSync({ entryPoints: [path.join(__dirname, '../../src/agent-tools.ts')], bundle: true,
   platform: 'node', format: 'cjs', external: ['vscode'], outfile: path.join(__dirname, '../../out/workspace-tools.cjs') });
-const { invokeAgentTool, toolResultsToMessages } = require('../../out/workspace-tools.cjs');
+const { invokeAgentTool, toolResultsToMessages, verifyResearchSources } = require('../../out/workspace-tools.cjs');
 
 suite('Agent workspace selection with real files', () => {
   let temporary, roots, folders, originalCount;
@@ -241,6 +241,34 @@ suite('Agent workspace selection with real files', () => {
       approvalMode: 'every', approve: async () => false,
     })).status, 'declined');
     assert.equal(await fs.readFile(path.join(roots[1].fsPath, 'same.txt'), 'utf8'), 'root-1');
+  });
+
+  test('research stays scoped and read-only under full access and verifies observed bytes', async () => {
+    const researchPolicy = { tools: ['read_file', 'search_workspace', 'list_workspace_files'], paths: ['same.txt'] };
+    const options = { approvalMode: 'full', researchPolicy, workspaceFolder: folders[1] };
+    const read = await call('read_file', { path: 'same.txt' }, folders[1], options);
+    assert.equal(read.status, 'success');
+    assert.equal(read.content, 'root-1');
+    await verifyResearchSources(read.researchSources, options);
+    assert.equal((await call('read_file', { path: 'package.json' }, folders[1], options)).status, 'error');
+    for (const name of ['write_file', 'delete_file', 'run_command']) {
+      assert.equal((await call(name, { path: 'same.txt', content: 'forbidden', command: process.execPath, args: ['-e', 'process.exit(1)'] }, folders[1], options)).status, 'error');
+    }
+    assert.equal(await fs.readFile(path.join(roots[1].fsPath, 'same.txt'), 'utf8'), 'root-1');
+    const listing = await call('list_workspace_files', {}, folders[1], options);
+    assert.equal(listing.content, 'same.txt');
+    const search = await call('search_workspace', { query: 'root-' }, folders[1], options);
+    assert.match(search.content, /same.txt:1: root-1/);
+    assert.doesNotMatch(search.content, /root-0/);
+    const document = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(roots[1], 'same.txt'));
+    const change = new vscode.WorkspaceEdit();
+    change.replace(document.uri, new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)), 'changed after research');
+    assert.equal(await vscode.workspace.applyEdit(change), true);
+    assert.equal(await document.save(), true);
+    await assert.rejects(verifyResearchSources(read.researchSources, options), /Research evidence changed/);
+    const controller = new AbortController();
+    controller.abort();
+    assert.equal((await call('search_workspace', { query: 'root-' }, folders[1], { ...options, signal: controller.signal })).status, 'error');
   });
 
   test('a removed folder during approval blocks writes and future invocations', async () => {
