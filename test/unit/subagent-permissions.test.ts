@@ -4,12 +4,14 @@ import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import type * as vscode from 'vscode';
 import { getAgentTools, invokeAgentTool, toolResultsToMessages, verifyResearchSources, type AgentToolOptions } from '../../src/agent-tools';
-import { RESEARCH_TOOLS, type ResearchPolicy } from '../../src/subagent-types';
+import { RESEARCH_TOOLS, DEFAULT_SUBAGENT_LIMITS, type ResearchPolicy, type SubagentManagerOptions } from '../../src/subagent-types';
+import { runSubagent } from '../../src/subagent-runner';
+import type { ChatCompletionRequest, StreamEvent } from '../../src/protocol';
 
 const env = vi.hoisted(() => ({
   folders: [] as vscode.WorkspaceFolder[], files: [] as vscode.Uri[],
   diagnostics: [] as [vscode.Uri, vscode.Diagnostic[]][],
-  read: vi.fn(), find: vi.fn(), approve: vi.fn(), effect: vi.fn(), cancel: vi.fn(),
+  read: vi.fn(), handleRead: vi.fn(), close: vi.fn(), find: vi.fn(), approve: vi.fn(), effect: vi.fn(), cancel: vi.fn(),
 }));
 
 vi.mock('vscode', () => {
@@ -32,6 +34,15 @@ vi.mock('vscode', () => {
 
 let root: string;
 let policy: ResearchPolicy;
+const nativeOpen = fs.open.bind(fs);
+async function observedOpen(...args: Parameters<typeof fs.open>) {
+  const handle = await nativeOpen(...args);
+  const read = handle.readFile.bind(handle);
+  const close = handle.close.bind(handle);
+  handle.readFile = ((options: Parameters<typeof handle.readFile>[0]) => env.handleRead(String(args[0]), () => read(options))) as typeof handle.readFile;
+  handle.close = async () => { env.close(); await close(); };
+  return handle;
+}
 function uri(relative: string): vscode.Uri {
   return { fsPath: path.resolve(root, relative), scheme: 'file', authority: '' } as vscode.Uri;
 }
@@ -40,7 +51,10 @@ function invoke(name: string, args: Record<string, unknown> = {}, options: Agent
 }
 
 beforeEach(async () => {
+  vi.restoreAllMocks();
   vi.resetAllMocks();
+  vi.spyOn(fs, 'open').mockImplementation(observedOpen);
+  env.handleRead.mockImplementation((_target: string, read: () => Promise<Buffer>) => read());
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'deeplocal-research-'));
   await fs.mkdir(path.join(root, 'src'));
   await fs.mkdir(path.join(root, 'src-other'));
@@ -56,7 +70,7 @@ beforeEach(async () => {
   policy = { tools: RESEARCH_TOOLS, paths: ['src'] };
 });
 
-afterEach(async () => { await fs.rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.restoreAllMocks(); await fs.rm(root, { recursive: true, force: true }); });
 
 it.each(['full', 'safe', 'every', 'ask'] as const)('denies forbidden direct tool calls before approval/effects in %s mode', async approvalMode => {
   for (const name of ['write_file', 'create_file', 'replace_in_file', 'delete_file', 'run_command', 'get_selection', 'get_active_file', 'get_workspace_summary', 'open_file', 'discover_verification_commands', 'invented']) {
@@ -83,7 +97,8 @@ it.each(['src-other/secret.txt', '../secret', 'src/../src/a.txt', 'src\\..\\src/
 it('filters discovery, search reads, and diagnostics to segment-bounded scope', async () => {
   expect((await invoke('list_workspace_files')).content).toBe('src/a.txt\nsrc/b.txt');
   expect((await invoke('search_workspace', { query: 'needle' })).content).toBe('src/a.txt:1: needle allowed\nsrc/b.txt:1: needle second');
-  expect(env.read.mock.calls.map(([target]) => target.fsPath)).toEqual([uri('src/a.txt').fsPath, uri('src/b.txt').fsPath]);
+  expect(env.handleRead.mock.calls.map(([target]) => target)).toEqual([uri('src/a.txt').fsPath, uri('src/b.txt').fsPath]);
+  expect(env.read).not.toHaveBeenCalled();
   const diagnostics = await invoke('get_diagnostics');
   expect(diagnostics.content).toContain('allowed diagnostic');
   expect(diagnostics.content).not.toContain('secret');
@@ -167,9 +182,9 @@ it('honors cancellation before discovery and after the first search read', async
   expect(await invoke('search_workspace', { query: 'needle' }, { signal: controller.signal })).toMatchObject({ status: 'error' });
   expect(env.find).not.toHaveBeenCalled();
   const running = new AbortController();
-  env.read.mockImplementation(async (target: vscode.Uri) => { const bytes = await fs.readFile(target.fsPath); running.abort(); return bytes; });
+  env.handleRead.mockImplementation(async (_target: string, read: () => Promise<Buffer>) => { const bytes = await read(); running.abort(); return bytes; });
   expect(await invoke('search_workspace', { query: 'needle' }, { signal: running.signal })).toMatchObject({ status: 'error' });
-  expect(env.read).toHaveBeenCalledTimes(1);
+  expect(env.handleRead).toHaveBeenCalledTimes(1);
 });
 
 it('passes a cancellation token to discovery and aborts before reading', async () => {
@@ -218,13 +233,203 @@ it('rejects out-of-scope and excessive verification metadata without reading fil
 
 it('stops evidence verification before reads and between source reads on cancellation', async () => {
   const result = await invoke('search_workspace', { query: 'needle' });
-  env.read.mockClear();
+  env.handleRead.mockClear();
   const pre = new AbortController();
   pre.abort();
   await expect(verifyResearchSources(result.researchSources!, { researchPolicy: policy, signal: pre.signal })).rejects.toThrow();
-  expect(env.read).not.toHaveBeenCalled();
+  expect(env.handleRead).not.toHaveBeenCalled();
   const running = new AbortController();
-  env.read.mockImplementation(async (target: vscode.Uri) => { const bytes = await fs.readFile(target.fsPath); running.abort(); return bytes; });
+  env.handleRead.mockImplementation(async (_target: string, read: () => Promise<Buffer>) => { const bytes = await read(); running.abort(); return bytes; });
   await expect(verifyResearchSources(result.researchSources!, { researchPolicy: policy, signal: running.signal })).rejects.toThrow();
-  expect(env.read).toHaveBeenCalledTimes(1);
+  expect(env.handleRead).toHaveBeenCalledTimes(1);
+  expect(env.close).toHaveBeenCalled();
+});
+
+async function substituteBeforeOpen(kind: 'file' | 'directory', restoreBeforeChecks: boolean): Promise<void> {
+  const source = path.join(root, kind === 'file' ? 'src/a.txt' : 'src');
+  const saved = path.join(root, 'original');
+  const excluded = path.join(root, kind === 'file' ? 'src-other/secret.txt' : 'src-other');
+  await fs.writeFile(path.join(root, 'src-other/a.txt'), 'needle secret');
+  vi.mocked(fs.open).mockImplementationOnce(async (...args) => {
+    await fs.rename(source, saved);
+    if (kind === 'file') await fs.link(excluded, source);
+    else await fs.symlink(excluded, source, process.platform === 'win32' ? 'junction' : 'dir');
+    try { return await observedOpen(...args); }
+    finally {
+      if (restoreBeforeChecks) {
+        await fs.rm(source, { recursive: kind === 'directory', force: true });
+        await fs.rename(saved, source);
+      }
+    }
+  });
+}
+
+it.each(['read_file', 'search_workspace'] as const)('rejects replacement identity before %s reads any bytes', async tool => {
+  env.files = [uri('src/a.txt')];
+  await substituteBeforeOpen('file', false);
+  const result = await invoke(tool, tool === 'read_file' ? { path: 'src/a.txt' } : { query: 'needle' });
+  expect(result.content).not.toContain('needle secret');
+  expect(result.researchSources ?? []).toEqual([]);
+  if (tool === 'read_file') expect(result.status).toBe('error');
+  else expect(result.researchLimitations?.join(' ')).toContain('coverage is incomplete');
+  expect(env.handleRead).not.toHaveBeenCalled();
+  expect(env.close).toHaveBeenCalledOnce();
+});
+
+it.each([
+  ['read_file', false], ['read_file', true], ['search_workspace', false], ['search_workspace', true],
+] as const)('rejects ancestor substitution before %s reads (restored before checks: %s)', async (tool, restore) => {
+  env.files = [uri('src/a.txt')];
+  await substituteBeforeOpen('directory', restore);
+  const result = await invoke(tool, tool === 'read_file' ? { path: 'src/a.txt' } : { query: 'needle' });
+  expect(result.content).not.toContain('needle secret');
+  expect(result.researchSources ?? []).toEqual([]);
+  expect(env.handleRead).not.toHaveBeenCalled();
+  expect(env.close).toHaveBeenCalledOnce();
+});
+
+it.each(['read_file', 'search_workspace'] as const)('never forwards substituted bytes from %s to a child model request', async tool => {
+  env.files = [uri('src/a.txt')];
+  await substituteBeforeOpen('directory', true);
+  const requests: ChatCompletionRequest[] = [];
+  const controller = new AbortController();
+  const task = { title: 'Inspect scoped source', objective: 'Inspect source', context: '', tools: [tool], paths: ['src'] };
+  const options: SubagentManagerOptions = {
+    requestId: 'root', model: 'test', signal: controller.signal, limits: { ...DEFAULT_SUBAGENT_LIMITS, enabled: true }, maxOutputTokens: 2048,
+    stream: async function* (_id, request): AsyncGenerator<StreamEvent> {
+      requests.push(structuredClone(request));
+      yield { kind: 'toolCall', value: { id: String(requests.length), type: 'function', function: {
+        name: requests.length === 1 ? tool : 'submit_research',
+        arguments: JSON.stringify(requests.length === 1 ? tool === 'read_file' ? { path: 'src/a.txt' } : { query: 'needle' } : { findings: [], limitations: [] }),
+      } } };
+    },
+    invoke: (_task, call, signal) => invokeAgentTool(call.id, call.function.name, call.function.arguments,
+      { signal, approvalMode: 'full', researchPolicy: policy }),
+    cancel: vi.fn(), reserve: vi.fn(), onActivity: vi.fn(),
+  };
+  const result = await runSubagent({ id: 'child', task, signal: controller.signal, options, reserveOutput: value => value });
+  expect(requests).toHaveLength(2);
+  expect(JSON.stringify(requests)).not.toContain('needle secret');
+  expect(result.limitations.join(' ')).toMatch(/changed|coverage is incomplete/);
+  expect(env.handleRead).not.toHaveBeenCalled();
+});
+
+it('keeps the pinned descriptor when a parent replacement is attempted immediately before reading', async () => {
+  let replacementBlocked = false;
+  env.handleRead.mockImplementationOnce(async (_target: string, read: () => Promise<Buffer>) => {
+    try { await fs.rename(path.join(root, 'src'), path.join(root, 'original')); }
+    catch (error) {
+      if (process.platform !== 'win32' || (error as NodeJS.ErrnoException).code !== 'EPERM') throw error;
+      replacementBlocked = true;
+      return read(); // Windows can prevent moving the parent while its file is open.
+    }
+    await fs.writeFile(path.join(root, 'src-other/a.txt'), 'needle secret');
+    await fs.symlink(path.join(root, 'src-other'), path.join(root, 'src'), process.platform === 'win32' ? 'junction' : 'dir');
+    const bytes = await read();
+    expect(bytes.toString()).toBe('needle allowed');
+    return bytes;
+  });
+  const result = await invoke('read_file', { path: 'src/a.txt' });
+  expect(result).toMatchObject(replacementBlocked
+    ? { status: 'success', content: 'needle allowed' }
+    : { status: 'error', content: expect.stringContaining('Research path changed') });
+  expect(result.content).not.toContain('needle secret');
+  expect(env.close).toHaveBeenCalledOnce();
+});
+
+it('rejects a changed file and closes its descriptor when a read throws', async () => {
+  env.handleRead.mockImplementationOnce(async () => { throw new Error('synthetic read failure'); });
+  expect(await invoke('read_file', { path: 'src/a.txt' })).toMatchObject({ status: 'error' });
+  expect(env.close).toHaveBeenCalledOnce();
+  env.handleRead.mockImplementationOnce(async (_target: string, read: () => Promise<Buffer>) => {
+    const bytes = await read();
+    await fs.appendFile(path.join(root, 'src/a.txt'), ' changed');
+    return bytes;
+  });
+  expect(await invoke('read_file', { path: 'src/a.txt' })).toMatchObject({ status: 'error', content: expect.stringContaining('changed while reading') });
+  expect(env.close).toHaveBeenCalledTimes(2);
+});
+
+it.each(['read_file', 'search_workspace'] as const)('rejects poisoned target metadata during %s snapshot capture', async tool => {
+  env.files = [uri('src/a.txt')];
+  await substituteBeforeOpen('directory', true);
+  const originalLstat = fs.lstat.bind(fs);
+  vi.spyOn(fs, 'lstat').mockImplementation((async (target: Parameters<typeof fs.lstat>[0], options: Parameters<typeof fs.lstat>[1]) => {
+    if (String(target) !== uri('src/a.txt').fsPath) return originalLstat(target, options);
+    const source = path.join(root, 'src');
+    const saved = path.join(root, 'original');
+    await fs.rename(source, saved);
+    await fs.symlink(path.join(root, 'src-other'), source, process.platform === 'win32' ? 'junction' : 'dir');
+    try { return await originalLstat(target, options); }
+    finally {
+      await fs.rm(source, { recursive: true, force: true });
+      await fs.rename(saved, source);
+    }
+  }) as typeof fs.lstat);
+  const result = await invoke(tool, tool === 'read_file' ? { path: 'src/a.txt' } : { query: 'needle' });
+  expect(result.content).not.toContain('needle secret');
+  expect(result.researchSources ?? []).toEqual([]);
+  expect(fs.open).not.toHaveBeenCalled();
+  expect(env.handleRead).not.toHaveBeenCalled();
+});
+
+it('recaptures a transient directory metadata change before opening a file', async () => {
+  const originalLstat = fs.lstat.bind(fs);
+  let changed = false;
+  vi.spyOn(fs, 'lstat').mockImplementation((async (target: Parameters<typeof fs.lstat>[0], options: Parameters<typeof fs.lstat>[1]) => {
+    const stat = await originalLstat(target, options);
+    if (!changed && String(target) === uri('src/a.txt').fsPath) {
+      changed = true;
+      await fs.mkdir(path.join(root, 'unrelated'));
+    }
+    return stat;
+  }) as typeof fs.lstat);
+  expect(await invoke('read_file', { path: 'src/a.txt' })).toMatchObject({ status: 'success', content: 'needle allowed' });
+  expect(changed).toBe(true);
+  expect(fs.open).toHaveBeenCalledOnce();
+  expect(env.handleRead).toHaveBeenCalledOnce();
+});
+
+it('bounds snapshot recapture without reading when a directory keeps changing', async () => {
+  const originalLstat = fs.lstat.bind(fs);
+  let changes = 0;
+  vi.spyOn(fs, 'lstat').mockImplementation((async (target: Parameters<typeof fs.lstat>[0], options: Parameters<typeof fs.lstat>[1]) => {
+    const stat = await originalLstat(target, options);
+    if (String(target) === uri('src/a.txt').fsPath) await fs.mkdir(path.join(root, `unrelated-${++changes}`));
+    return stat;
+  }) as typeof fs.lstat);
+  expect(await invoke('read_file', { path: 'src/a.txt' })).toMatchObject({ status: 'error' });
+  expect(changes).toBe(6); // Three captures, each checking the target twice.
+  expect(fs.open).not.toHaveBeenCalled();
+  expect(env.handleRead).not.toHaveBeenCalled();
+});
+
+it('retains the initial canonical root across snapshot recaptures', async () => {
+  const originalLstat = fs.lstat.bind(fs);
+  const originalRealpath = fs.realpath.bind(fs);
+  let redirected = false;
+  let rootChecks = 0;
+  vi.spyOn(fs, 'lstat').mockImplementation((async (target: Parameters<typeof fs.lstat>[0], options: Parameters<typeof fs.lstat>[1]) => {
+    const stat = await originalLstat(target, options);
+    if (!redirected && String(target) === uri('src/a.txt').fsPath) {
+      await fs.mkdir(path.join(root, 'unrelated'));
+      redirected = true;
+    }
+    return stat;
+  }) as typeof fs.lstat);
+  vi.spyOn(fs, 'realpath').mockImplementation((async (target: Parameters<typeof fs.realpath>[0], ...args: unknown[]) => {
+    if (String(target) === root && ++rootChecks > 3 && redirected) return path.join(root, 'src-other');
+    return originalRealpath(target, ...args as []);
+  }) as typeof fs.realpath);
+  expect(await invoke('read_file', { path: 'src/a.txt' })).toMatchObject({ status: 'error', content: expect.stringContaining('workspace changed') });
+  expect(fs.open).not.toHaveBeenCalled();
+});
+
+it('permits unrelated directory activity once a trusted descriptor is pinned', async () => {
+  env.handleRead.mockImplementationOnce(async (_target: string, read: () => Promise<Buffer>) => {
+    await fs.mkdir(path.join(root, 'unrelated'));
+    return read();
+  });
+  expect(await invoke('read_file', { path: 'src/a.txt' })).toMatchObject({ status: 'success', content: 'needle allowed' });
+  expect(env.close).toHaveBeenCalledOnce();
 });
